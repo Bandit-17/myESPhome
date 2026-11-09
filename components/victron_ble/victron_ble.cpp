@@ -10,6 +10,19 @@ namespace victron_ble {
 
 static const char *const TAG = "victron_ble";
 
+// Local hex formatter ("AA:BB:CC"), independent of ESPHome's helper API which changes between versions.
+// `out` must hold at least 3 * len bytes (len <= VICTRON_ENCRYPTED_DATA_MAX_SIZE -> 49 bytes is enough).
+[[maybe_unused]] static const char *hex_pretty(char *out, size_t out_size, const uint8_t *data, size_t len) {
+  if (out_size == 0)
+    return out;
+  size_t pos = 0;
+  for (size_t i = 0; i < len && pos + 3 < out_size; i++) {
+    pos += snprintf(out + pos, out_size - pos, i == 0 ? "%02X" : ":%02X", data[i]);
+  }
+  out[pos < out_size ? pos : out_size - 1] = '\0';
+  return out;
+}
+
 void VictronBle::dump_config() {
   ESP_LOGCONFIG(TAG, "Victron BLE:");
   ESP_LOGCONFIG(TAG, "  Address: %s", this->address_str().c_str());
@@ -169,8 +182,9 @@ bool VictronBle::parse_device(const esp32_ble_tracker::ESPBTDevice &device) {
 
   const u_int8_t *crypted_data = manu_data.data.data() + sizeof(VICTRON_BLE_RECORD_BASE);
   const u_int8_t crypted_len = manu_data.data.size() - sizeof(VICTRON_BLE_RECORD_BASE);
+  [[maybe_unused]] char hex_buf[3 * VICTRON_ENCRYPTED_DATA_MAX_SIZE + 1];
   ESP_LOGVV(TAG, "[%s] Cryted message: %s", this->address_str().c_str(),
-            format_hex_pretty(crypted_data, crypted_len).c_str());
+            hex_pretty(hex_buf, sizeof(hex_buf), crypted_data, crypted_len));
 
   if (!this->is_record_type_supported_(victron_data->record_type, crypted_len)) {
     // Error logging is done by `is_record_type_supported_`.
@@ -221,8 +235,9 @@ bool VictronBle::encrypt_message_(const u_int8_t *crypted_data, const u_int8_t c
   }
 
   esp_aes_free(&ctx);
+  [[maybe_unused]] char hex_buf[3 * VICTRON_ENCRYPTED_DATA_MAX_SIZE + 1];
   ESP_LOGV(TAG, "[%s] Encrypted message: %s", this->address_str().c_str(),
-           format_hex_pretty(encrypted_data, crypted_len).c_str());
+           hex_pretty(hex_buf, sizeof(hex_buf), encrypted_data, crypted_len));
   return true;
 }
 

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <cstdio>
+#include <string>
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
@@ -922,12 +924,13 @@ class VictronBle : public esp32_ble_tracker::ESPBTDeviceListener, public Compone
   inline std::string address_str() const {
     if (this->address_ == 0) {
       return "";
-    } else {
-      return str_snprintf("%02X:%02X:%02X:%02X:%02X:%02X", 17, (uint8_t) (this->address_ >> 40) & 0xff,
-                          (uint8_t) (this->address_ >> 32) & 0xff, (uint8_t) (this->address_ >> 24) & 0xff,
-                          (uint8_t) (this->address_ >> 16) & 0xff, (uint8_t) (this->address_ >> 8) & 0xff,
-                          (uint8_t) (this->address_ >> 0) & 0xff);
     }
+    char buf[18];  // "XX:XX:XX:XX:XX:XX" + '\0'
+    snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X", (uint8_t) (this->address_ >> 40) & 0xff,
+             (uint8_t) (this->address_ >> 32) & 0xff, (uint8_t) (this->address_ >> 24) & 0xff,
+             (uint8_t) (this->address_ >> 16) & 0xff, (uint8_t) (this->address_ >> 8) & 0xff,
+             (uint8_t) (this->address_ >> 0) & 0xff);
+    return std::string(buf);
   }
 
   void set_bindkey(std::array<uint8_t, 16> key) { this->bindkey_ = key; }
