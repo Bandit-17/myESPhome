@@ -1,0 +1,322 @@
+/// @file ch9438.h
+/// @brief WCH CH9438 (SPI to 8 UART + 8 GPIO) - classes declaration
+/// @details The hub (CH9438Component) owns the SPI link and the pin multiplexing. Each configured UART is a
+/// CH9438Channel (an esphome::uart::UARTComponent, so any UART consumer can use it) and each GPIO is exposed
+/// through CH9438GPIOPin.
+
+#pragma once
+#include <algorithm>
+#include <array>
+#include <vector>
+#include "esphome/core/component.h"
+#include "esphome/core/defines.h"
+#include "esphome/core/gpio.h"
+#include "esphome/core/hal.h"
+#ifdef USE_CH9438_RESTORE_BAUD_RATE
+#include "esphome/core/preferences.h"
+#endif
+#include "esphome/components/spi/spi.h"
+#include "esphome/components/uart/uart.h"
+#ifdef USE_TEXT_SENSOR
+#include "esphome/components/text_sensor/text_sensor.h"
+#endif
+#include "ch9438_defs.h"
+
+namespace esphome::ch9438 {
+
+class CH9438Component;
+
+/// @brief Software ring buffer in which the bytes read from a chip FIFO are stored until the consumer takes them.
+/// @details The capacity is chosen at run time. The chip FIFO is read directly into the ring (write_ptr / commit)
+/// so that no intermediate copy is needed.
+class RxRing {
+ public:
+  void init(size_t capacity) {
+    this->buf_.assign(capacity, 0);
+    this->clear();
+  }
+  size_t capacity() const { return this->buf_.size(); }
+  size_t count() const { return this->count_; }
+  size_t free() const { return this->buf_.size() - this->count_; }
+  bool is_full() const { return this->count_ == this->buf_.size(); }
+  bool is_empty() const { return this->count_ == 0; }
+  void clear() { this->head_ = this->tail_ = this->count_ = 0; }
+
+  /// @brief pointer to the next free slot; up to contiguous_free() bytes can be written there, then commit() them
+  uint8_t *write_ptr() { return this->buf_.data() + this->head_; }
+  size_t contiguous_free() const {
+    return std::min(this->buf_.size() - this->count_, this->buf_.size() - this->head_);
+  }
+  void commit(size_t n) {
+    this->head_ = (this->head_ + n) % this->buf_.size();
+    this->count_ += n;
+  }
+  bool peek(uint8_t &value) const {
+    if (this->count_ == 0)
+      return false;
+    value = this->buf_[this->tail_];
+    return true;
+  }
+  /// @brief removes up to n bytes and copies them to dst
+  size_t pop_bulk(uint8_t *dst, size_t n) {
+    n = std::min(n, this->count_);
+    size_t const first = std::min(n, this->buf_.size() - this->tail_);
+    std::copy_n(this->buf_.data() + this->tail_, first, dst);
+    std::copy_n(this->buf_.data(), n - first, dst + first);
+    this->tail_ = (this->tail_ + n) % this->buf_.size();
+    this->count_ -= n;
+    if (this->count_ == 0)  // empty: restart at the beginning so that the next bulk write stays contiguous
+      this->head_ = this->tail_ = 0;
+    return n;
+  }
+
+ protected:
+  std::vector<uint8_t> buf_;
+  size_t head_{0};
+  size_t tail_{0};
+  size_t count_{0};
+};
+
+/// @brief One UART of the chip, seen by ESPHome as a regular UARTComponent
+class CH9438Channel : public uart::UARTComponent {
+ public:
+  void set_parent(CH9438Component *parent);
+  void set_channel(uint8_t channel) { this->channel_ = channel; }
+  uint8_t get_channel() const { return this->channel_; }
+  void set_channel_name(const char *name) { this->name_ = name; }
+  const char *get_channel_name() const { return this->name_; }
+  void set_rx_buffer_size(size_t size) { this->rx_buffer_size_ = size; }
+  void set_flow_control(bool enabled) { this->flow_control_ = enabled; }
+
+  /// @brief initialise the chip registers of this UART (FIFO reset, line settings, baud rate, interrupts)
+  void setup_channel();
+  /// @brief change the baud rate at run time (used by the ch9438.change_baud_rate action)
+  /// @details The bytes still in the transmit FIFO are sent first at the old speed. What was received before the
+  /// change is dropped (it was received at the old speed). Returns false (and changes nothing) when the value is
+  /// outside the range supported by the chip or when the transmit FIFO could not be emptied.
+  bool change_baud_rate(uint32_t baud_rate);
+#ifdef USE_CH9438_RESTORE_BAUD_RATE
+  void set_restore_baud_rate(bool restore) { this->restore_baud_rate_ = restore; }
+#endif
+  void dump_channel();
+
+  // uart::UARTComponent interface
+  void write_array(const uint8_t *buffer, size_t length) override;
+  bool read_array(uint8_t *buffer, size_t length) override;
+  bool peek_byte(uint8_t *buffer) override;
+  size_t available() override;
+  uart::UARTFlushResult flush() override;
+#if defined(USE_ESP8266) || defined(USE_ESP32)
+  void load_settings(bool dump_config) override {
+    this->set_line_param_();
+    this->set_baudrate_();
+  }
+  using UARTComponent::load_settings;
+#endif
+
+ protected:
+  friend class CH9438Component;
+
+  void check_logger_conflict() override {}
+  void set_line_param_();
+  void set_baudrate_();
+  /// @brief reset both chip FIFOs of this UART (and keep them enabled)
+  void reset_fifo_();
+
+  /// @brief true when the channel emulates 7 data bits (the chip itself always uses 8)
+  bool seven_bits_() const {
+#ifdef USE_CH9438_DATA_BITS_7
+    return this->data_bits_ == 7;
+#else
+    return false;
+#endif
+  }
+  /// @brief number of bits of the longest frame on the line (used for the timeouts)
+  static constexpr uint32_t MAX_FRAME_BITS = 12;
+
+#ifdef USE_CH9438_DATA_BITS_7
+  /// @brief Emulate 7 data bits: the 8th bit sent by the chip carries the parity (or a stop level without parity).
+  /// @param src bytes to send (only the 7 low bits are used)
+  /// @param dst receives the bytes to give to the chip
+  void encode_7bits_(const uint8_t *src, uint8_t *dst, size_t length) const;
+  /// @brief Check the parity carried by the 8th bit, count the errors and clear that bit (in place)
+  void decode_7bits_(uint8_t *data, size_t length);
+#endif
+  /// @brief number of bytes that can still be written in the chip transmit FIFO
+  size_t tx_free_();
+  /// @brief move up to `count` bytes from the chip receive FIFO to the ring buffer
+  size_t xfer_fifo_to_buffer_(size_t count);
+  uint8_t reg_addr_(uint8_t reg) const { return static_cast<uint8_t>(this->channel_ * 8 + reg); }
+
+  RxRing receive_buffer_;
+  CH9438Component *parent_{nullptr};
+  uint8_t channel_{0};
+  const char *name_{""};
+  size_t rx_buffer_size_{256};
+  bool flow_control_{false};
+  uint8_t lcr_{LCR_WORD_8};  ///< line control register value currently programmed
+  uint32_t last_overflow_log_{0};
+#ifdef USE_CH9438_DATA_BITS_7
+  uint32_t parity_errors_{0};  ///< parity errors seen since boot when emulating 7 data bits
+#endif
+#ifdef USE_CH9438_RESTORE_BAUD_RATE
+  struct SavedBaudRate {
+    uint32_t config_baud_rate;  ///< baud rate of the configuration when the value was saved
+    uint32_t baud_rate;
+  };
+  ESPPreferenceObject pref_;
+  uint32_t config_baud_rate_{0};
+  bool restore_baud_rate_{false};
+#endif
+};
+
+/// @brief One of the 8 GPIO of the chip
+class CH9438GPIOPin : public GPIOPin {
+ public:
+  void set_parent(CH9438Component *parent) { this->parent_ = parent; }
+  void set_pin(uint8_t pin) { this->pin_ = pin; }
+  void set_inverted(bool inverted) { this->inverted_ = inverted; }
+  void set_flags(gpio::Flags flags) { this->flags_ = flags; }
+
+  void setup() override;
+  void pin_mode(gpio::Flags flags) override;
+  bool digital_read() override;
+  void digital_write(bool value) override;
+  size_t dump_summary(char *buffer, size_t len) const override;
+  gpio::Flags get_flags() const override { return this->flags_; }
+
+ protected:
+  CH9438Component *parent_{nullptr};
+  uint8_t pin_{0};
+  bool inverted_{false};
+  gpio::Flags flags_{gpio::FLAG_NONE};
+};
+
+/// @brief The chip itself: SPI link, pin multiplexing, clock, interrupt line and status polling
+class CH9438Component : public Component,
+                        public spi::SPIDevice<spi::BIT_ORDER_MSB_FIRST, spi::CLOCK_POLARITY_LOW,
+                                              spi::CLOCK_PHASE_LEADING, spi::DATA_RATE_4MHZ> {
+ public:
+  // configuration (called by the generated code)
+  /// @param hz frequency of the external crystal in Hz, 0 = internal clock (192 MHz). The chip multiplies the
+  /// crystal by 12 to get the UART reference clock (only 16 MHz is documented by the vendor).
+  void set_crystal(uint32_t hz) {
+    this->crystal_hz_ = hz;
+    this->crystal_ = hz != 0;
+    this->uart_clock_ = hz != 0 ? hz * PLL_MULTIPLIER : UART_REF_CLOCK;
+  }
+  /// @brief reference clock of the UARTs: baud = uart_clock / divisor
+  uint32_t get_uart_clock() const { return this->uart_clock_; }
+  /// @brief lowest baud rate reachable with the 16 bit divisor
+  uint32_t get_baud_min() const { return (this->uart_clock_ + DIVISOR_MAX - 1) / DIVISOR_MAX; }
+  /// @brief highest baud rate (divisor 16)
+  uint32_t get_baud_max() const { return this->uart_clock_ / DIVISOR_MIN; }
+  void set_irq_pin(InternalGPIOPin *pin) { this->irq_pin_ = pin; }
+  /// @brief optional RST# output (low level resets the chip)
+  void set_reset_pin(GPIOPin *pin) { this->reset_pin_ = pin; }
+  void set_tnow_mask(uint8_t enable, uint8_t invert) {
+    this->tnow_mask_ = enable;
+    this->tnow_invert_ = invert;
+  }
+  void set_cts_mask(uint8_t mask) { this->cts_mask_ = mask; }
+  void set_rts_mask(uint8_t mask) { this->rts_mask_ = mask; }
+  void set_name(const char *name) { this->name_ = name; }
+  const char *get_name() const { return this->name_; }
+  /// @param test_mode 0 = normal operation; 1 = loopback of a short message; 2 = loopback of a 1024 byte pattern.
+  /// Only effective when the component is compiled with CH9438_TEST_COMPONENT (done by the `test_mode` option).
+  void set_test_mode(int test_mode) { this->test_mode_ = test_mode; }
+#ifdef USE_TEXT_SENSOR
+  void set_version_text_sensor(text_sensor::TextSensor *sensor) { this->version_text_sensor_ = sensor; }
+#endif
+
+  void setup() override;
+  void loop() override;
+  void dump_config() override;
+  /// The hub sits just below the buses: its UARTs and GPIOs are used as if they were part of a bus
+  float get_setup_priority() const override { return setup_priority::BUS - 0.1F; }
+
+  // low level register access (the timings required by the chip are handled here)
+  uint8_t read_reg(uint8_t reg);
+  void write_reg(uint8_t reg, uint8_t value);
+  void read_burst(uint8_t reg, uint8_t *data, size_t length, uint32_t delay_us = CMD_DELAY_US);
+  void write_burst(uint8_t reg, const uint8_t *data, size_t length);
+
+  // GPIO helpers used by CH9438GPIOPin
+  void gpio_enable(uint8_t pin);
+  void gpio_set_mode(uint8_t pin, gpio::Flags flags);
+  bool gpio_read(uint8_t pin);
+  void gpio_write(uint8_t pin, bool value);
+
+ protected:
+  friend class CH9438Channel;
+  friend class CH9438GPIOPin;
+
+  /// @brief wait until the chip had its minimum idle time since the previous transaction
+  void gap_();
+  /// @brief write a multiplexing command and wait for the chip acknowledge
+  bool iofunc_set_(uint8_t cmd, uint8_t addr, bool enable);
+  bool probe_();
+  bool config_pins_();
+  bool config_clock_();
+  void config_tnow_();
+  void detect_tx_counter_semantic_();
+  /// @brief read the status of all UARTs in one SPI transaction and move the received bytes to the ring buffers
+  void poll_();
+#ifdef CH9438_TEST_COMPONENT
+  void test_pre_loop_();
+  void test_poll_done_(uint32_t duration_us);
+  void test_run_();
+  void test_report_stats_(uint32_t now);
+#endif
+
+  std::vector<CH9438Channel *> children_{};
+  InternalGPIOPin *irq_pin_{nullptr};
+  GPIOPin *reset_pin_{nullptr};
+#ifdef USE_TEXT_SENSOR
+  text_sensor::TextSensor *version_text_sensor_{nullptr};
+#endif
+  const char *name_{"ch9438"};
+  uint32_t last_end_us_{0};
+  uint8_t chip_ver_[4]{0, 0, 0, 0};
+  uint8_t tnow_mask_{0};
+  uint8_t tnow_invert_{0};
+  uint8_t cts_mask_{0};  ///< bit n: CTS of UART n used (n = 1..4)
+  uint8_t rts_mask_{0};  ///< bit n: RTS of UART n used (n = 1..4)
+  uint8_t gpio_enabled_{0};
+  bool crystal_{false};
+  uint32_t crystal_hz_{0};
+  uint32_t uart_clock_{UART_REF_CLOCK};
+  /// true: the TX FIFO counter register returns the free space (datasheet); false: it returns the used space
+  bool tx_counter_is_free_{true};
+  int test_mode_{0};
+
+#ifdef CH9438_TEST_COMPONENT
+  // statistics (reset every report period)
+  uint32_t spi_count_{0};         ///< SPI transactions
+  uint32_t spi_us_{0};            ///< time spent in the SPI transactions (includes the mandatory chip delays)
+  uint32_t test_loops_{0};        ///< calls of loop()
+  uint32_t test_last_loop_us_{0};
+  uint32_t test_max_gap_us_{0};   ///< longest time between two calls of loop()
+  uint32_t test_polls_{0};        ///< number of status reads
+  uint32_t test_poll_us_{0};
+  uint32_t test_poll_max_us_{0};
+  uint32_t test_rx_bytes_{0};     ///< bytes moved from the chip FIFOs to the ring buffers
+  uint32_t test_stats_ms_{0};
+  // loopback test state machine (one channel at a time)
+  bool test_busy_{false};
+  size_t test_idx_{0};
+  uint32_t test_next_ms_{0};
+  uint32_t test_deadline_ms_{0};
+  uint32_t test_start_us_{0};
+  size_t test_pos_{0};
+  uint32_t test_errors_{0};
+  uint32_t test_runs_{0};
+  uint32_t test_failures_{0};
+  std::vector<uint8_t> test_tx_{};
+#endif
+};
+
+}  // namespace esphome::ch9438
+
+// actions (ch9438.change_baud_rate): included here so that the generated code finds them
+#include "esphome/components/ch9438/automation.h"
