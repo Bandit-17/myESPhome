@@ -1,0 +1,62 @@
+import esphome.codegen as cg
+import esphome.config_validation as cv
+from esphome.components import number
+from esphome.const import (
+    CONF_ID,
+    UNIT_DECIBEL_MILLIWATT,
+    ICON_SIGNAL,
+    # MODE_SLIDER,
+    ENTITY_CATEGORY_CONFIG,
+)
+
+from .. import CONF_RYLR998_ID, rylr998_ns, RYLR998Component
+
+DEPENDENCIES = ["rylr998"]
+
+# Défini localement — absent de certaines versions d'esphome.const
+CONF_TX_POWER = "tx_power"
+
+RYLR998TxPowerNumber = rylr998_ns.class_(
+    "RYLR998TxPowerNumber", number.Number
+)
+
+# ── Schema ────────────────────────────────────────────────────────────────────
+
+# AT+CRFOP accepte 0-22dBm sur RYLR998, 0-30dBm sur RYLR999. On expose ici la
+# borne large (30) pour ne pas dupliquer la logique de variante côté Python :
+# le clamp réel par variante est appliqué au runtime dans
+# RYLR998Component::apply_tx_power() (rylr998.cpp), donc une valeur envoyée
+# depuis Home Assistant au-delà du max du module cible sera silencieusement
+# bridée et loggée en WARN, jamais transmise telle quelle en AT+CRFOP.
+TX_POWER_MIN = 0
+TX_POWER_MAX = 30
+TX_POWER_STEP = 1
+
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(CONF_RYLR998_ID): cv.use_id(RYLR998Component),
+        cv.Optional(CONF_TX_POWER): number.number_schema(
+            RYLR998TxPowerNumber,
+            unit_of_measurement=UNIT_DECIBEL_MILLIWATT,
+            icon=ICON_SIGNAL,
+            entity_category=ENTITY_CATEGORY_CONFIG,
+            # mode=MODE_SLIDER,
+        ),
+    }
+)
+
+
+# ── Code generation ───────────────────────────────────────────────────────────
+
+async def to_code(config):
+    parent = await cg.get_variable(config[CONF_RYLR998_ID])
+
+    if CONF_TX_POWER in config:
+        n = await number.new_number(
+            config[CONF_TX_POWER],
+            min_value=TX_POWER_MIN,
+            max_value=TX_POWER_MAX,
+            step=TX_POWER_STEP,
+        )
+        cg.add(n.set_parent(parent))
+        cg.add(parent.set_tx_power_number(n))
